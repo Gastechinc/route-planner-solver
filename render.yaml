@@ -1,0 +1,30 @@
+# Render Blueprint for the GTI Route Planner solver.
+#
+# How to use:
+#   1. Push this repo to GitHub
+#   2. In Render dashboard → New → Blueprint → connect this repo
+#   3. Render picks up render.yaml automatically; you'll be asked to fill in
+#      the two SECRET env vars (SOLVER_TOKEN, MAPBOX_TOKEN) on first deploy.
+#
+# Free tier:
+#   - Service sleeps after 15min of inactivity
+#   - First request after sleep takes ~30s to wake
+#   - Bump to "starter" ($7/mo) for always-on if cold start hurts UX
+
+services:
+  - type: web
+    name: route-planner-solver
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # Shared secret between Vercel and this service. Vercel posts with
+      # `X-Auth-Token: $SOLVER_TOKEN`; we 401 anything that doesn't match.
+      - key: SOLVER_TOKEN
+        sync: false   # marked secret — set in dashboard on first deploy
+      # Mapbox public token (pk.*) — used server-side here to keep the
+      # token off the browser entirely. Optional: missing = mock matrix.
+      - key: MAPBOX_TOKEN
+        sync: false
