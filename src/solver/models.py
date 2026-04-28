@@ -49,6 +49,13 @@ class Job:
     earliest_access: time = time(8, 0)
     duration_minutes: int = 60
     required_parts: tuple[RequiredPart, ...] = ()
+    # 2PL — needs two engineers on scene simultaneously. The optimiser
+    # duplicates the job into a primary + secondary node before passing
+    # to the solver; the secondary carries `is_pair_secondary=True` so
+    # the response post-processor can collapse it back to one job in
+    # the unassigned list.
+    two_engineer: bool = False
+    is_pair_secondary: bool = False
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,14 @@ class Stop:
     departure_minute: int
     travel_seconds_from_previous: int
     missing_parts: tuple[str, ...] = ()
+    # 2PL — name of the OTHER engineer attending this same job.
+    # None for single-engineer jobs.
+    paired_with: str | None = None
+    # True if this stop is the "shadow" routed onto the second engineer
+    # so their day plan reflects the visit. The frontend treats the
+    # primary stop (False) as the canonical one for things like the
+    # customer-confirmation email button.
+    is_pair_secondary: bool = False
 
 
 @dataclass
@@ -119,6 +134,12 @@ class JobIn(BaseModel):
     earliest_access: TimeStr = "08:00"
     duration_minutes: int = Field(default=60, ge=1, le=600)
     required_parts: list[RequiredPartIn] = Field(default_factory=list)
+    two_engineer: bool = Field(
+        default=False,
+        description="2PL — needs two engineers on scene simultaneously. "
+        "The optimiser duplicates the node and constrains both stops to "
+        "different vehicles + arrivals within 30 min of each other.",
+    )
 
     @field_validator("postcode")
     @classmethod
@@ -133,6 +154,7 @@ class JobIn(BaseModel):
             earliest_access=_parse_time(self.earliest_access),
             duration_minutes=self.duration_minutes,
             required_parts=tuple(p.to_internal() for p in self.required_parts),
+            two_engineer=self.two_engineer,
         )
 
 
@@ -207,6 +229,8 @@ class StopOut(BaseModel):
     departure_time: TimeStr
     travel_seconds_from_previous: int
     missing_parts: list[str] = Field(default_factory=list)
+    paired_with: str | None = None
+    is_pair_secondary: bool = False
 
 
 class EngineerRouteOut(BaseModel):
@@ -245,6 +269,8 @@ def stop_to_out(stop: Stop) -> StopOut:
         departure_time=_format_time(_minutes_to_time(stop.departure_minute)),
         travel_seconds_from_previous=stop.travel_seconds_from_previous,
         missing_parts=list(stop.missing_parts),
+        paired_with=stop.paired_with,
+        is_pair_secondary=stop.is_pair_secondary,
     )
 
 

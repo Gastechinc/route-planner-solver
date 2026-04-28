@@ -52,6 +52,10 @@ JOB_BALANCE_SPAN_COST = 200
 OVERTIME_ALLOWANCE_MIN = 120
 # Max search time. The problem is tiny (≤4 vehicles × ≤16 jobs).
 SEARCH_TIME_SECONDS = 10
+# 2PL — both engineers must arrive within this many minutes of each other.
+# Generous enough to absorb traffic noise, tight enough that they're genuinely
+# on-site together (not back-to-back drop-bys 25 min apart).
+PAIR_ARRIVAL_TOLERANCE_MIN = 30
 
 
 def time_to_minutes(t: time) -> int:
@@ -100,7 +104,19 @@ def solve_vrptw(
     travel: TravelMatrix,
     stock: StockSnapshot | None = None,
     billing_only_codes: list[str] | None = None,
+    pair_map: dict[int, int] | None = None,
 ) -> SolveResult:
+    """Solve the VRPTW for the given engineers + jobs.
+
+    `pair_map` (optional): for 2PL jobs the optimiser duplicates the job into
+    primary + secondary "shadow" entries in `jobs`. The map is
+    `{secondary_job_idx: primary_job_idx}` — both indices into `jobs`. The
+    solver then enforces:
+      • secondary and primary on different vehicles
+      • |arrival(secondary) − arrival(primary)| ≤ PAIR_ARRIVAL_TOLERANCE_MIN
+      • either both routed or both dropped (so no engineer turns up alone
+        for a 2-engineer job)
+    """
     if not engineers:
         return SolveResult(routes=[], unassigned=list(jobs))
     if not jobs:
@@ -199,6 +215,40 @@ def solve_vrptw(
                 index = manager.NodeToIndex(n_eng + j_idx)
                 routing.VehicleVar(index).SetValues(list(eligible) + [-1])
 
+    # 2PL pairing — different vehicles, arrivals synced, both-or-neither.
+    # Constraints are gated on ActiveVar so dropping the pair (when no
+    # feasible 2-engineer assignment exists) is still allowed; otherwise
+    # the solver would refuse the whole plan instead of just shedding
+    # the unrouteable 2PL.
+    if pair_map:
+        cp_solver = routing.solver()
+        big_m = HORIZON_MIN + PAIR_ARRIVAL_TOLERANCE_MIN
+        for sec_j_idx, prim_j_idx in pair_map.items():
+            sec_index = manager.NodeToIndex(n_eng + sec_j_idx)
+            prim_index = manager.NodeToIndex(n_eng + prim_j_idx)
+            sec_veh = routing.VehicleVar(sec_index)
+            prim_veh = routing.VehicleVar(prim_index)
+            sec_time = time_dim.CumulVar(sec_index)
+            prim_time = time_dim.CumulVar(prim_index)
+            sec_active = routing.ActiveVar(sec_index)
+            prim_active = routing.ActiveVar(prim_index)
+
+            # Both-or-neither — never schedule one half of a 2PL.
+            cp_solver.Add(sec_active == prim_active)
+            # Different vehicle, but only enforced when both are routed.
+            # vehicle_diff is a 0/1 — must be 1 whenever both active.
+            vehicle_diff = cp_solver.IsDifferent(sec_veh, prim_veh)
+            cp_solver.Add(vehicle_diff >= sec_active)
+            # Arrival within tolerance — slacked off when the pair is dropped.
+            cp_solver.Add(
+                sec_time - prim_time
+                <= PAIR_ARRIVAL_TOLERANCE_MIN + big_m * (1 - sec_active)
+            )
+            cp_solver.Add(
+                prim_time - sec_time
+                <= PAIR_ARRIVAL_TOLERANCE_MIN + big_m * (1 - sec_active)
+            )
+
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
@@ -208,8 +258,22 @@ def solve_vrptw(
     if solution is None:
         return SolveResult(routes=[], unassigned=list(jobs))
 
+    # First pass: walk each route, recording vehicle assignments so we can
+    # resolve "paired_with" engineer names in a second pass below.
     routes: list[EngineerRoute] = []
     assigned_job_indices: set[int] = set()
+    job_idx_to_engineer: dict[int, str] = {}
+    # Per-route parallel list of job indices, lined up with route.stops, so
+    # the second pass can look up the original job_idx without falling back
+    # to fragile object-identity comparisons against `jobs`.
+    route_stop_job_idx: list[list[int]] = []
+
+    # Build the bidirectional partner map (primary↔secondary) for paired-name lookup.
+    partner_of: dict[int, int] = {}
+    if pair_map:
+        for sec_j_idx, prim_j_idx in pair_map.items():
+            partner_of[sec_j_idx] = prim_j_idx
+            partner_of[prim_j_idx] = sec_j_idx
 
     for v in range(n_eng):
         eng = engineers[v]
@@ -217,12 +281,14 @@ def solve_vrptw(
         prev_node = manager.IndexToNode(idx)
 
         route = EngineerRoute(engineer=eng)
+        per_stop_job_idx: list[int] = []
         idx = solution.Value(routing.NextVar(idx))
         while not routing.IsEnd(idx):
             node = manager.IndexToNode(idx)
             arrival = solution.Value(time_dim.CumulVar(idx))
             travel_sec = travel.seconds[prev_node][node]
-            job = jobs[node - n_eng]
+            job_idx = node - n_eng
+            job = jobs[job_idx]
             missing = tuple(_missing_parts(eng, job, stock, billing_only_codes))
             route.stops.append(
                 Stop(
@@ -231,9 +297,12 @@ def solve_vrptw(
                     departure_minute=arrival + job.duration_minutes,
                     travel_seconds_from_previous=travel_sec,
                     missing_parts=missing,
+                    is_pair_secondary=job.is_pair_secondary,
                 )
             )
-            assigned_job_indices.add(node - n_eng)
+            assigned_job_indices.add(job_idx)
+            job_idx_to_engineer[job_idx] = eng.name
+            per_stop_job_idx.append(job_idx)
             route.total_drive_seconds += travel_sec
             route.total_service_minutes += job.duration_minutes
             prev_node = node
@@ -243,6 +312,33 @@ def solve_vrptw(
         route.total_drive_seconds += travel.seconds[prev_node][end_node]
         route.return_minute = solution.Value(time_dim.CumulVar(idx))
         routes.append(route)
+        route_stop_job_idx.append(per_stop_job_idx)
 
-    unassigned = [jobs[i] for i in range(n_jobs) if i not in assigned_job_indices]
+    # Second pass — now that every job is mapped to its engineer, fill in
+    # `paired_with` names on each side of every 2PL pair.
+    if partner_of:
+        for route, per_stop in zip(routes, route_stop_job_idx):
+            for i, (stop, job_idx) in enumerate(zip(route.stops, per_stop)):
+                if job_idx not in partner_of:
+                    continue
+                partner_name = job_idx_to_engineer.get(partner_of[job_idx])
+                if partner_name is None:
+                    continue
+                # Stop is frozen — replace with a new one carrying paired_with.
+                route.stops[i] = Stop(
+                    job=stop.job,
+                    arrival_minute=stop.arrival_minute,
+                    departure_minute=stop.departure_minute,
+                    travel_seconds_from_previous=stop.travel_seconds_from_previous,
+                    missing_parts=stop.missing_parts,
+                    is_pair_secondary=stop.is_pair_secondary,
+                    paired_with=partner_name,
+                )
+
+    # Drop pair secondaries from `unassigned` — the primary already
+    # represents the job; surfacing the secondary too would double-count.
+    unassigned = [
+        jobs[i] for i in range(n_jobs)
+        if i not in assigned_job_indices and not jobs[i].is_pair_secondary
+    ]
     return SolveResult(routes=routes, unassigned=unassigned)

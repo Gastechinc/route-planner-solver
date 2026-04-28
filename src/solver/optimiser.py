@@ -96,7 +96,45 @@ def optimise(
             f"{', '.join(unavailable_names)}."
         )
 
-    postcodes = [e.home_postcode for e in active_engineers] + [j.postcode for j in jobs]
+    # 2PL handling — duplicate each two-engineer job into primary +
+    # "shadow" secondary so the solver can route both engineers to the
+    # same site. Constraints on the secondary (different vehicle, synced
+    # arrival, drop-together) are added inside solve_vrptw via pair_map.
+    expanded_jobs: list[Job] = []
+    pair_map: dict[int, int] = {}  # secondary_idx → primary_idx (in expanded_jobs)
+    pair_count = 0
+    for job in jobs:
+        primary_idx = len(expanded_jobs)
+        expanded_jobs.append(job)
+        if job.two_engineer:
+            secondary = Job(
+                call_number=job.call_number,
+                site_name=job.site_name,
+                postcode=job.postcode,
+                earliest_access=job.earliest_access,
+                duration_minutes=job.duration_minutes,
+                # Secondary doesn't carry parts — only the primary's van
+                # needs the part. (If the office wants both vans stocked,
+                # they can split the work into two separate jobs.)
+                required_parts=(),
+                two_engineer=True,
+                is_pair_secondary=True,
+            )
+            secondary_idx = len(expanded_jobs)
+            expanded_jobs.append(secondary)
+            pair_map[secondary_idx] = primary_idx
+            pair_count += 1
+
+    if pair_count and len(active_engineers) < 2:
+        warnings.append(
+            f"{pair_count} two-engineer job(s) cannot be scheduled — need at "
+            "least 2 available engineers today. They will be left unassigned."
+        )
+
+    postcodes = (
+        [e.home_postcode for e in active_engineers]
+        + [j.postcode for j in expanded_jobs]
+    )
     n_engineers = len(active_engineers)
 
     try:
@@ -143,18 +181,25 @@ def optimise(
         matrix, parking_affected = apply_parking_buffer(matrix, postcodes, n_engineers)
         parking_affected_set = set(parking_affected)
         if parking_affected:
-            job_names_affected = [
-                jobs[i - n_engineers].site_name
-                for i in parking_affected if 0 <= (i - n_engineers) < len(jobs)
-            ]
+            # Dedup site names — secondary 2PL stops repeat the primary's
+            # name, which would otherwise show twice in the warning.
+            seen: set[str] = set()
+            job_names_affected: list[str] = []
+            for i in parking_affected:
+                j_idx = i - n_engineers
+                if 0 <= j_idx < len(expanded_jobs):
+                    name = expanded_jobs[j_idx].site_name
+                    if name not in seen:
+                        seen.add(name)
+                        job_names_affected.append(name)
             warnings.append(
-                f"Added 15-min parking buffer for {len(parking_affected)} central-London "
+                f"Added 15-min parking buffer for {len(job_names_affected)} central-London "
                 f"job(s): {', '.join(job_names_affected[:5])}"
                 f"{'…' if len(job_names_affected) > 5 else ''}"
             )
 
     if stock is None:
-        needs_parts = [j for j in jobs if j.required_parts]
+        needs_parts = [j for j in expanded_jobs if j.required_parts]
         if needs_parts:
             warnings.append(
                 f"{len(needs_parts)} job(s) have required parts but no stock data was "
@@ -163,9 +208,10 @@ def optimise(
 
     # ---- Pass 1: initial solve with live-now (+ parking) matrix ----
     result = solve_vrptw(
-        active_engineers, jobs, matrix,
+        active_engineers, expanded_jobs, matrix,
         stock=stock,
         billing_only_codes=billing_only_codes,
+        pair_map=pair_map,
     )
 
     # ---- Pass 2: refine with per-arc depart_at, then re-solve ----
@@ -187,9 +233,10 @@ def optimise(
                     parking_affected_nodes=parking_affected_set,
                 )
                 final_result = solve_vrptw(
-                    active_engineers, jobs, refined_matrix,
+                    active_engineers, expanded_jobs, refined_matrix,
                     stock=stock,
                     billing_only_codes=billing_only_codes,
+                    pair_map=pair_map,
                 )
                 result = final_result
                 warnings.append(
