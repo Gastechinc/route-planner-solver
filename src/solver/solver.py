@@ -237,7 +237,10 @@ def solve_vrptw(
             cp_solver.Add(sec_active == prim_active)
             # Different vehicle, but only enforced when both are routed.
             # vehicle_diff is a 0/1 — must be 1 whenever both active.
-            vehicle_diff = cp_solver.IsDifferent(sec_veh, prim_veh)
+            # NB: the method is `IsDifferentVar` (two IntVars) — `IsDifferent`
+            # without the suffix doesn't exist on the OR-Tools constraint
+            # solver and would crash at solve time.
+            vehicle_diff = cp_solver.IsDifferentVar(sec_veh, prim_veh)
             cp_solver.Add(vehicle_diff >= sec_active)
             # Arrival within tolerance — slacked off when the pair is dropped.
             cp_solver.Add(
