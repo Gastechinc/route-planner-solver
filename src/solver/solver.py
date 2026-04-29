@@ -47,6 +47,14 @@ MISSING_PART_PENALTY_MIN = 5000
 # job costs as much as 200 extra drive minutes" — the solver will accept
 # meaningful drive-time increases to keep workload roughly even.
 JOB_BALANCE_SPAN_COST = 200
+# Penalty for leaving an active engineer with zero stops. The business pays
+# every available engineer regardless of work; getting them on the road for
+# at least one job both covers their cost and primes the team for late
+# add-ons. 480 = 8h of drive — strong enough to dominate any reasonable
+# concentration saving (a typical London cross-town leg is 30-60 min) but
+# soft, so when geography genuinely makes a stop too costly the solver
+# pays the penalty rather than refusing the plan.
+IDLE_ENGINEER_PENALTY_MIN = 480
 # Engineers may finish up to this many minutes past their contracted work_end
 # without penalty — normal "bank-some-hours" behaviour.
 OVERTIME_ALLOWANCE_MIN = 120
@@ -197,6 +205,19 @@ def solve_vrptw(
     routing.AddDimension(jobs_cb_idx, 0, n_jobs, True, "JobCount")
     jobs_dim = routing.GetDimensionOrDie("JobCount")
     jobs_dim.SetGlobalSpanCostCoefficient(JOB_BALANCE_SPAN_COST)
+
+    # Soft "minimum 1 stop per engineer" — if there are at least as many
+    # jobs as engineers, the solver should give every engineer something.
+    # SetCumulVarSoftLowerBound on the route's end node penalises (1 - n_stops)
+    # × IDLE_ENGINEER_PENALTY_MIN whenever a route is left empty, so the
+    # solver actively reaches for work to fill an idle van. When jobs < eng
+    # the penalty is unavoidable — paid, not enforced — keeping the model
+    # feasible. Skipped when jobs < engineers so we don't prefer
+    # impossible-to-staff plans.
+    if n_jobs >= n_eng:
+        for v in range(n_eng):
+            end_idx = routing.End(v)
+            jobs_dim.SetCumulVarSoftLowerBound(end_idx, 1, IDLE_ENGINEER_PENALTY_MIN)
 
     for j_idx in range(n_jobs):
         node = n_eng + j_idx
