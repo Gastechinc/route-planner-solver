@@ -36,6 +36,11 @@ from solver.stock import StockSnapshot
 SOLVER_TOKEN = os.environ.get("SOLVER_TOKEN", "").strip()
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN", "").strip() or None
 SERVICE_VERSION = "0.1.0"
+# Render auto-injects RENDER_GIT_COMMIT on every deploy (full 40-char SHA).
+# Surface the short form so the web app's footer can show what's running
+# without the office having to dig through the dashboard.
+COMMIT_SHA = os.environ.get("RENDER_GIT_COMMIT", "").strip()
+COMMIT_SHORT = COMMIT_SHA[:7] if COMMIT_SHA else "dev"
 
 app = FastAPI(
     title="GTI Route Planner — solver",
@@ -61,6 +66,7 @@ def root() -> dict[str, Any]:
     return {
         "service": "route-planner-solver",
         "version": SERVICE_VERSION,
+        "commit": COMMIT_SHORT,
         "mapbox": "configured" if MAPBOX_TOKEN else "missing — using mock matrix",
     }
 
