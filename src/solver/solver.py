@@ -338,10 +338,14 @@ def solve_vrptw(
                     paired_with=partner_name,
                 )
 
-    # Drop pair secondaries from `unassigned` — the primary already
-    # represents the job; surfacing the secondary too would double-count.
+    # Drop SHADOW secondaries from `unassigned` — those are synthetic
+    # duplicates the optimiser added to route a single 2PL call across
+    # two engineers; surfacing them too would double-count the same job.
+    # Real-pair secondaries (two distinct call_numbers raised at one
+    # site) are kept: if the pair fails to route, the office should see
+    # both call_numbers in the unassigned list.
     unassigned = [
         jobs[i] for i in range(n_jobs)
-        if i not in assigned_job_indices and not jobs[i].is_pair_secondary
+        if i not in assigned_job_indices and not jobs[i].is_shadow_duplicate
     ]
     return SolveResult(routes=routes, unassigned=unassigned)

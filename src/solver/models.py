@@ -49,13 +49,17 @@ class Job:
     earliest_access: time = time(8, 0)
     duration_minutes: int = 60
     required_parts: tuple[RequiredPart, ...] = ()
-    # 2PL — needs two engineers on scene simultaneously. The optimiser
-    # duplicates the job into a primary + secondary node before passing
-    # to the solver; the secondary carries `is_pair_secondary=True` so
-    # the response post-processor can collapse it back to one job in
-    # the unassigned list.
+    # 2PL — needs two engineers on scene simultaneously.
+    #   Real pair: two distinct call_numbers raised at the same site/day,
+    #     both flagged two_engineer. The optimiser pairs them directly
+    #     (one is_pair_secondary=True, neither is_shadow_duplicate).
+    #   Lone 2PL: only one call_number raised. The optimiser duplicates
+    #     it into a shadow secondary so both engineers get the visit;
+    #     the shadow has is_shadow_duplicate=True and is filtered out
+    #     of the unassigned list.
     two_engineer: bool = False
     is_pair_secondary: bool = False
+    is_shadow_duplicate: bool = False
 
 
 @dataclass(frozen=True)

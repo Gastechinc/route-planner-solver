@@ -6,6 +6,7 @@ plainly).
 """
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime
 
 from solver.geocoding import GeocodeError, geocode_postcodes
@@ -96,33 +97,80 @@ def optimise(
             f"{', '.join(unavailable_names)}."
         )
 
-    # 2PL handling — duplicate each two-engineer job into primary +
-    # "shadow" secondary so the solver can route both engineers to the
-    # same site. Constraints on the secondary (different vehicle, synced
-    # arrival, drop-together) are added inside solve_vrptw via pair_map.
-    expanded_jobs: list[Job] = []
+    # 2PL handling.
+    #
+    # Office workflow: when a 2PL site/day is raised, two separate call
+    # numbers are typically created — one per engineer attending. Group
+    # all `two_engineer` jobs by site_name and treat:
+    #   - 2 jobs in a group → real pair: feed both as-is, no duplication.
+    #   - 1 job in a group  → lone 2PL: fall back to duplicate-shadow so
+    #                          a single call still routes two engineers.
+    #   - 3+ jobs in a group → pair the first two; surface the rest with
+    #                          shadow duplication and add a warning so the
+    #                          office can sanity-check.
+    # Constraints on each pair (different vehicle, synced arrival,
+    # drop-together) are added inside solve_vrptw via pair_map.
+    twopl_groups: dict[str, list[int]] = {}
+    non_pair_indices: list[int] = []
+    for i, job in enumerate(jobs):
+        if job.two_engineer:
+            site_key = (job.site_name or "").strip().lower()
+            twopl_groups.setdefault(site_key, []).append(i)
+        else:
+            non_pair_indices.append(i)
+
+    expanded_jobs: list[Job] = [jobs[i] for i in non_pair_indices]
     pair_map: dict[int, int] = {}  # secondary_idx → primary_idx (in expanded_jobs)
     pair_count = 0
-    for job in jobs:
-        primary_idx = len(expanded_jobs)
-        expanded_jobs.append(job)
-        if job.two_engineer:
-            secondary = Job(
-                call_number=job.call_number,
-                site_name=job.site_name,
-                postcode=job.postcode,
-                earliest_access=job.earliest_access,
-                duration_minutes=job.duration_minutes,
-                # Secondary doesn't carry parts — only the primary's van
-                # needs the part. (If the office wants both vans stocked,
-                # they can split the work into two separate jobs.)
-                required_parts=(),
-                two_engineer=True,
-                is_pair_secondary=True,
-            )
-            secondary_idx = len(expanded_jobs)
+
+    def _shadow(orig: Job) -> Job:
+        # Shadow secondary: same site, no parts (only the primary van
+        # needs the part), and is_shadow_duplicate so the response
+        # post-processor can drop it from the unassigned list.
+        return dataclasses.replace(
+            orig,
+            required_parts=(),
+            is_pair_secondary=True,
+            is_shadow_duplicate=True,
+        )
+
+    for site_key, indices in twopl_groups.items():
+        if len(indices) >= 2:
+            # Real pair: use the first two real jobs as primary + secondary,
+            # no duplication. Both keep their own call_numbers and parts.
+            primary = jobs[indices[0]]
+            secondary = dataclasses.replace(jobs[indices[1]], is_pair_secondary=True)
+            prim_idx = len(expanded_jobs)
+            expanded_jobs.append(primary)
+            sec_idx = len(expanded_jobs)
             expanded_jobs.append(secondary)
-            pair_map[secondary_idx] = primary_idx
+            pair_map[sec_idx] = prim_idx
+            pair_count += 1
+
+            # 3+ same-site 2PL jobs is unusual — pair-and-shadow each extra
+            # so the office sees them all routed, plus a warning.
+            for extra_i in indices[2:]:
+                warnings.append(
+                    f"3+ two-engineer jobs at '{primary.site_name}' "
+                    f"(#{', #'.join(jobs[k].call_number for k in indices)}) — "
+                    "paired the first two; extras routed independently."
+                )
+                ex_prim_idx = len(expanded_jobs)
+                expanded_jobs.append(jobs[extra_i])
+                ex_sec_idx = len(expanded_jobs)
+                expanded_jobs.append(_shadow(jobs[extra_i]))
+                pair_map[ex_sec_idx] = ex_prim_idx
+                pair_count += 1
+                break  # only one warning per group
+        else:
+            # Lone 2PL: duplicate-shadow fallback — one real call,
+            # two engineers needed.
+            orig = jobs[indices[0]]
+            prim_idx = len(expanded_jobs)
+            expanded_jobs.append(orig)
+            sec_idx = len(expanded_jobs)
+            expanded_jobs.append(_shadow(orig))
+            pair_map[sec_idx] = prim_idx
             pair_count += 1
 
     if pair_count and len(active_engineers) < 2:
