@@ -83,6 +83,14 @@ PREFERENCE_MISMATCH_PENALTY_MIN = 90
 # ~10:45 at the latest, not 10:59. Hard constraint; if no slot can clear
 # the buffer the job is dropped via the disjunction (same as before).
 LATEST_DEPARTURE_BUFFER_MIN = 15
+# Trainee service-time bonus. When an engineer is flagged is_trainee=True,
+# the solver pads every job assigned to them by this many minutes — so a
+# 60-min job becomes a 90-min slot on a trainee's route. Applied to
+# service time only (travel is unchanged), via per-vehicle time transit
+# callbacks. The deadline check (latest_departure) is tightened globally
+# by the team-max bonus so a trainee can't be assigned a windowed job
+# they couldn't finish in time.
+TRAINEE_DURATION_BONUS_MIN = 30
 
 
 def time_to_minutes(t: time) -> int:
@@ -200,17 +208,42 @@ def solve_vrptw(
         cb_idx = routing.RegisterTransitCallback(make_cost_cb(v))
         routing.SetArcCostEvaluatorOfVehicle(cb_idx, v)
 
-    # Time dimension uses pure travel time (no parts penalty).
-    def time_transit_cb(from_idx: int, to_idx: int) -> int:
-        f = manager.IndexToNode(from_idx)
-        t = manager.IndexToNode(to_idx)
-        service = jobs[f - n_eng].duration_minutes if f >= n_eng else 0
-        return service + (travel.seconds[f][t] // 60)
+    # Time dimension uses pure travel time (no parts penalty), with a
+    # per-vehicle service bonus for trainees. Each engineer gets their
+    # own transit callback so a job's service time depends on which
+    # engineer is doing it — Carl/trainee = duration + 30, otherwise
+    # just duration. Required for AddDimensionWithVehicleTransits below.
+    def make_time_transit_cb(vehicle_idx: int):
+        eng = engineers[vehicle_idx]
+        bonus = TRAINEE_DURATION_BONUS_MIN if eng.is_trainee else 0
 
-    time_cb_idx = routing.RegisterTransitCallback(time_transit_cb)
+        def cb(from_idx: int, to_idx: int) -> int:
+            f = manager.IndexToNode(from_idx)
+            t = manager.IndexToNode(to_idx)
+            service = jobs[f - n_eng].duration_minutes if f >= n_eng else 0
+            if f >= n_eng and bonus:
+                service += bonus
+            return service + (travel.seconds[f][t] // 60)
 
-    routing.AddDimension(time_cb_idx, HORIZON_MIN, HORIZON_MIN, False, "Time")
+        return cb
+
+    time_cb_indices = [
+        routing.RegisterTransitCallback(make_time_transit_cb(v))
+        for v in range(n_eng)
+    ]
+
+    routing.AddDimensionWithVehicleTransits(
+        time_cb_indices, HORIZON_MIN, HORIZON_MIN, False, "Time"
+    )
     time_dim = routing.GetDimensionOrDie("Time")
+    # Team-max trainee bonus — used to tighten the off-site deadline
+    # check below so a trainee can't be assigned a windowed job they
+    # can't finish in time. Non-trainees get extra slack on those
+    # jobs as a side effect, which is harmless.
+    team_max_trainee_bonus = max(
+        (TRAINEE_DURATION_BONUS_MIN if e.is_trainee else 0 for e in engineers),
+        default=0,
+    )
 
     for v, eng in enumerate(engineers):
         start_idx = routing.Start(v)
@@ -250,16 +283,25 @@ def solve_vrptw(
         # makes the job infeasible.
         if job.latest_departure is not None:
             deadline = time_to_minutes(job.latest_departure)
+            # Effective service for the deadline check. We don't know which
+            # vehicle will take the job at constraint time, so we pessimise
+            # — assume any trainee on the team could be assigned. Without
+            # this, a trainee could legally be picked for a windowed job
+            # whose duration+30 doesn't fit before the deadline, blowing
+            # the constraint mid-route. Side effect: non-trainees get
+            # extra slack on these jobs (harmless).
+            effective_service = job.duration_minutes + team_max_trainee_bonus
             buffer_min = LATEST_DEPARTURE_BUFFER_MIN
             # If the buffered constraint would make this job infeasible
-            # (earliest + duration + buffer > deadline), back off the
+            # (earliest + effective + buffer > deadline), back off the
             # buffer so the job can still be scheduled rather than
             # dropped — better to run the deadline tight than refuse
-            # the work.
-            if earliest + job.duration_minutes + buffer_min > deadline:
-                buffer_min = max(0, deadline - earliest - job.duration_minutes)
+            # the work. The trainee bonus is NOT backed off here — that
+            # would mean a trainee got the job but couldn't finish.
+            if earliest + effective_service + buffer_min > deadline:
+                buffer_min = max(0, deadline - earliest - effective_service)
             cp_solver_for_windows.Add(
-                time_dim.CumulVar(index) + job.duration_minutes + buffer_min
+                time_dim.CumulVar(index) + effective_service + buffer_min
                 <= deadline
             )
 
@@ -495,6 +537,12 @@ def solve_vrptw(
 
     for v in range(n_eng):
         eng = engineers[v]
+        # Trainee bonus is applied per-job at output time so the
+        # displayed depart-from-this-site reflects the actual time
+        # the engineer leaves (arrival + duration + bonus). Without
+        # this, the route panel would show a tighter slot than the
+        # engineer's actual time progression — confusing the office.
+        trainee_bonus = TRAINEE_DURATION_BONUS_MIN if eng.is_trainee else 0
         idx = routing.Start(v)
         prev_node = manager.IndexToNode(idx)
 
@@ -508,11 +556,12 @@ def solve_vrptw(
             job_idx = node - n_eng
             job = jobs[job_idx]
             missing = tuple(_missing_parts(eng, job, stock, billing_only_codes))
+            effective_service = job.duration_minutes + trainee_bonus
             route.stops.append(
                 Stop(
                     job=job,
                     arrival_minute=arrival,
-                    departure_minute=arrival + job.duration_minutes,
+                    departure_minute=arrival + effective_service,
                     travel_seconds_from_previous=travel_sec,
                     missing_parts=missing,
                     is_pair_secondary=job.is_pair_secondary,
@@ -522,7 +571,7 @@ def solve_vrptw(
             job_idx_to_engineer[job_idx] = eng.name
             per_stop_job_idx.append(job_idx)
             route.total_drive_seconds += travel_sec
-            route.total_service_minutes += job.duration_minutes
+            route.total_service_minutes += effective_service
             prev_node = node
             idx = solution.Value(routing.NextVar(idx))
 

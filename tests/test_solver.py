@@ -696,3 +696,121 @@ def test_engineer_preference_yields_to_capacity() -> None:
     # Both should be routed — preference is soft, feasibility wins.
     assert "30601" in routed_calls, "PMV A must still be routed"
     assert "30602" in routed_calls, "PMV B must still be routed"
+
+
+def test_trainee_bonus_inflates_service_time() -> None:
+    """
+    A trainee engineer doing a 60-min job has their on-site duration padded
+    by TRAINEE_DURATION_BONUS_MIN — the displayed depart-from-this-site
+    must reflect arrival + duration + bonus, and total_service_minutes for
+    the route must include the bonus per stop. Otherwise a non-trainee
+    engineer with the same job is unchanged.
+    """
+    from solver.solver import TRAINEE_DURATION_BONUS_MIN
+
+    payload = _base_two_engineer_payload()
+    # Carl is the trainee; Gavin is not. Both have one job.
+    payload["engineers"][0]["is_trainee"] = True
+    payload["jobs"] = [
+        {
+            "call_number": "30700",
+            "site_name": "Trainee site",
+            # Near Carl (EN5 1AA) so geography routes it to him.
+            "postcode": "N1 1AA",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+        },
+        {
+            "call_number": "30701",
+            "site_name": "Non-trainee site",
+            # Near Gavin (TW3 1QQ) so it routes to him.
+            "postcode": "TW1 1AA",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    by_call_route: dict[str, dict] = {}
+    for rt in data["routes"]:
+        for stop in rt["stops"]:
+            by_call_route[stop["call_number"]] = {"stop": stop, "route": rt}
+
+    # Carl (trainee) — service should be 60 + bonus.
+    carl = by_call_route["30700"]
+    assert carl["route"]["engineer_name"] == "Carl Wellington"
+    carl_service = carl["stop"]["departure_minute"] - carl["stop"]["arrival_minute"]
+    assert carl_service == 60 + TRAINEE_DURATION_BONUS_MIN, (
+        f"Trainee Carl's stop should run {60 + TRAINEE_DURATION_BONUS_MIN} min "
+        f"(60 base + {TRAINEE_DURATION_BONUS_MIN} bonus); got {carl_service}"
+    )
+
+    # Gavin (non-trainee) — unchanged.
+    gavin = by_call_route["30701"]
+    assert gavin["route"]["engineer_name"] == "Gavin Daley Bovell"
+    gavin_service = gavin["stop"]["departure_minute"] - gavin["stop"]["arrival_minute"]
+    assert gavin_service == 60, (
+        f"Non-trainee Gavin's stop should run 60 min; got {gavin_service}"
+    )
+
+    # Route totals reflect the bonus too.
+    carl_route_total = next(
+        rt["total_service_minutes"]
+        for rt in data["routes"]
+        if rt["engineer_name"] == "Carl Wellington"
+    )
+    gavin_route_total = next(
+        rt["total_service_minutes"]
+        for rt in data["routes"]
+        if rt["engineer_name"] == "Gavin Daley Bovell"
+    )
+    assert carl_route_total == 60 + TRAINEE_DURATION_BONUS_MIN
+    assert gavin_route_total == 60
+
+
+def test_trainee_bonus_tightens_latest_departure_deadline() -> None:
+    """
+    With a trainee on the team, a windowed job whose duration + bonus
+    can't fit before the off-site deadline must be DROPPED rather than
+    routed to a non-trainee with a tight deadline — the deadline check
+    is global (we don't know which vehicle will take it). Earliest
+    08:00, deadline 09:00, duration 60: non-trainee could just fit
+    (60 ≤ 60); with a trainee on the team, deadline tightens by 30
+    and the job becomes infeasible.
+    """
+    from solver.solver import TRAINEE_DURATION_BONUS_MIN
+
+    assert TRAINEE_DURATION_BONUS_MIN == 30  # guard
+
+    payload = _base_two_engineer_payload()
+    payload["engineers"][0]["is_trainee"] = True
+    payload["jobs"] = [
+        {
+            "call_number": "30710",
+            "site_name": "Tight window",
+            "postcode": "WC1A 1BS",
+            "earliest_access": "08:00",
+            "latest_departure": "09:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    routed = [
+        stop
+        for rt in data["routes"]
+        for stop in rt["stops"]
+        if stop["call_number"] == "30710"
+    ]
+    unassigned = [u for u in data["unassigned"] if u["call_number"] == "30710"]
+    # 08:00 + 60 + 30 buffer = 09:30 > 09:00 deadline → infeasible
+    # under the team-max-bonus rule. Should be dropped.
+    assert routed == [], (
+        f"Job must be dropped under trainee-tightened deadline; got {routed}"
+    )
+    assert len(unassigned) == 1

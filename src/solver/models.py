@@ -99,6 +99,12 @@ class Engineer:
     # a job whose category isn't in this set is assigned to them.
     # Tuple (not list) so the dataclass stays frozen + hashable.
     preferred_call_categories: tuple[str, ...] = ()
+    # Trainee bonus — when True, the optimiser pads every job assigned
+    # to this engineer's vehicle by TRAINEE_DURATION_BONUS_MIN. The
+    # buffer is only applied to *service* time, not travel — keeps
+    # geography decisions honest while ensuring trainees aren't
+    # over-packed.
+    is_trainee: bool = False
 
 
 @dataclass(frozen=True)
@@ -243,6 +249,15 @@ class EngineerIn(BaseModel):
         "soft penalty applied when a job whose category isn't in this "
         "list is assigned to them.",
     )
+    is_trainee: bool = Field(
+        default=False,
+        description=(
+            "Trainee bonus. When true, the optimiser pads every job "
+            "assigned to this engineer by a fixed amount (currently 30 "
+            "min) so they aren't over-packed. Applied to service time "
+            "only — travel is unchanged."
+        ),
+    )
 
     @field_validator("home_postcode", "vehicle_reg")
     @classmethod
@@ -258,6 +273,7 @@ class EngineerIn(BaseModel):
             vehicle_reg=self.vehicle_reg,
             availability=self.availability,
             preferred_call_categories=tuple(self.preferred_call_categories),
+            is_trainee=self.is_trainee,
         )
 
 
