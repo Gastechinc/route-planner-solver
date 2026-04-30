@@ -84,6 +84,14 @@ class Job:
     # biases toward better-matched engineers. None ⇒ no preference
     # check (treated as a generalist match).
     call_category: str | None = None
+    # Diagnostic — populated by diagnose_unassigned() AFTER the solver
+    # returns when this job ended up unassigned. Surfaced to the office
+    # in the "couldn't be assigned" panel so they don't have to guess
+    # whether it's a parts issue, a window, a missing engineer, etc.
+    # Empty string is *not* used as a sentinel — None means "no specific
+    # cause identified" and gets a generic fallback message client-side.
+    unassigned_reason: str | None = None
+    unassigned_reason_tag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -343,6 +351,18 @@ class JobOut(BaseModel):
     call_number: str
     site_name: str
     postcode: str
+    # Friendly reason the job ended up unassigned, computed by
+    # diagnose_unassigned() after the solver returns. Office sees this
+    # in the "couldn't be assigned" panel so they don't have to guess
+    # whether it's a parts issue, a window, a missing engineer, etc.
+    reason: str | None = None
+    # Short tag for styling/filtering on the client. Kept stable across
+    # phrasing changes to `reason`.
+    reason_tag: (
+        # see _diagnose_unassigned for the full list. Add carefully —
+        # the web side renders icons by tag.
+        str | None
+    ) = None
 
 
 class OptimiseResponse(BaseModel):

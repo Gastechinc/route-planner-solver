@@ -115,6 +115,8 @@ def optimise_endpoint(payload: OptimiseRequest, request: Request) -> OptimiseRes
                 call_number=j.call_number,
                 site_name=j.site_name,
                 postcode=j.postcode,
+                reason=j.unassigned_reason,
+                reason_tag=j.unassigned_reason_tag,
             )
             for j in result.unassigned
         ],

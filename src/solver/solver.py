@@ -29,7 +29,14 @@ from datetime import time
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-from solver.models import Engineer, EngineerRoute, Job, SolveResult, Stop
+from solver.models import (
+    Availability,
+    Engineer,
+    EngineerRoute,
+    Job,
+    SolveResult,
+    Stop,
+)
 from solver.stock import StockSnapshot
 from solver.travel import TravelMatrix
 
@@ -153,7 +160,13 @@ def solve_vrptw(
         for a 2-engineer job)
     """
     if not engineers:
-        return SolveResult(routes=[], unassigned=list(jobs))
+        return SolveResult(
+            routes=[],
+            unassigned=[
+                diagnose_unassigned(j, engineers, stock, billing_only_codes)
+                for j in jobs
+            ],
+        )
     if not jobs:
         return SolveResult(
             routes=[EngineerRoute(engineer=e) for e in engineers],
@@ -516,7 +529,13 @@ def solve_vrptw(
 
     solution = routing.SolveWithParameters(params)
     if solution is None:
-        return SolveResult(routes=[], unassigned=list(jobs))
+        return SolveResult(
+            routes=[],
+            unassigned=[
+                diagnose_unassigned(j, engineers, stock, billing_only_codes)
+                for j in jobs
+            ],
+        )
 
     # First pass: walk each route, recording vehicle assignments so we can
     # resolve "paired_with" engineer names in a second pass below.
@@ -612,4 +631,179 @@ def solve_vrptw(
         jobs[i] for i in range(n_jobs)
         if i not in assigned_job_indices and not jobs[i].is_shadow_duplicate
     ]
-    return SolveResult(routes=routes, unassigned=unassigned)
+    # Attach a friendly reason for each — the office shouldn't have to
+    # guess between parts shortage, infeasible window, forced-engineer
+    # mismatch, etc. Returns the same Job dataclass with `unassigned_reason`
+    # / `unassigned_reason_tag` populated where we can identify a clear
+    # cause; otherwise None (meaning "the solver dropped this on cost
+    # grounds — typically over-packed engineers / time-window squeeze").
+    diagnosed = [
+        diagnose_unassigned(j, engineers, stock, billing_only_codes)
+        for j in unassigned
+    ]
+    return SolveResult(routes=routes, unassigned=diagnosed)
+
+
+def diagnose_unassigned(
+    job: Job,
+    engineers: list[Engineer],
+    stock: StockSnapshot | None,
+    billing_only_codes: list[str] | None,
+) -> Job:
+    """
+    Return the job dataclass with `unassigned_reason` / `unassigned_reason_tag`
+    populated when we can pin down why the solver dropped it.
+
+    Reasons checked, in priority order:
+      1. parts_shortage — no available engineer's van has the full set of
+         required parts. This is the parts-aware HARD constraint kicking in;
+         the office needs to either re-allocate stock or add the parts to
+         a van.
+      2. forced_engineer_unavailable — the COL assignment locked the job
+         to an engineer who's OFF / on annual leave today.
+      3. window_too_tight — earliest_access + duration > customer's
+         latest_departure deadline (with the trainee bonus tightening
+         applied if any trainees are on the team).
+      4. window_after_workday — earliest_access is so late that no
+         engineer can finish before their work_end (+ overtime allowance).
+      5. two_engineer_pair_dropped — 2PL job whose partner also failed
+         to route (the pairing constraint demands both-or-neither).
+
+    None reason means we couldn't isolate one of these — usually the
+    solver dropped the job because every engineer was over-packed once
+    higher-priority work landed. The office can clear that by removing
+    something else or extending availability.
+    """
+    available = [e for e in engineers if e.availability == Availability.AVAILABLE]
+
+    # 1. Parts shortage — every engineer (including unavailable ones for
+    # diagnostic purposes) is missing at least one part.
+    if job.required_parts and stock is not None:
+        missing_per_eng = [
+            _missing_parts(e, job, stock, billing_only_codes)
+            for e in engineers
+        ]
+        if all(m for m in missing_per_eng):
+            short_codes = sorted(
+                {code for missing in missing_per_eng for code in missing}
+            )
+            preview = ", ".join(short_codes[:3])
+            if len(short_codes) > 3:
+                preview += f" +{len(short_codes) - 3} more"
+            return _with_reason(
+                job,
+                tag="parts_shortage",
+                reason=(
+                    f"No van has all required parts (missing: {preview}). "
+                    "Re-stock or re-allocate before optimising."
+                ),
+            )
+
+    # 2. Forced engineer (COL) — locked to someone unavailable.
+    if job.forced_engineer_name:
+        target = next(
+            (e for e in engineers if e.name == job.forced_engineer_name),
+            None,
+        )
+        if target and target.availability != Availability.AVAILABLE:
+            return _with_reason(
+                job,
+                tag="forced_engineer_unavailable",
+                reason=(
+                    f"Locked to {target.name}, who's "
+                    f"{target.availability.value.lower().replace('_', ' ')} today. "
+                    "Re-assign or change their availability."
+                ),
+            )
+        if not target and available:
+            return _with_reason(
+                job,
+                tag="forced_engineer_unavailable",
+                reason=(
+                    f"Locked to '{job.forced_engineer_name}' but no "
+                    "engineer with that name is in the team."
+                ),
+            )
+
+    # 3. Window vs duration — including the trainee bonus if any.
+    if job.latest_departure is not None:
+        team_max_bonus = max(
+            (
+                TRAINEE_DURATION_BONUS_MIN if e.is_trainee else 0
+                for e in engineers
+            ),
+            default=0,
+        )
+        earliest = time_to_minutes(job.earliest_access)
+        deadline = time_to_minutes(job.latest_departure)
+        if earliest + job.duration_minutes + team_max_bonus > deadline:
+            slack = deadline - earliest - job.duration_minutes
+            return _with_reason(
+                job,
+                tag="window_too_tight",
+                reason=(
+                    f"Window too tight: {earliest // 60:02d}:{earliest % 60:02d}"
+                    f"–{deadline // 60:02d}:{deadline % 60:02d} can't fit "
+                    f"{job.duration_minutes} min duration"
+                    + (f" + {team_max_bonus} min trainee bonus" if team_max_bonus else "")
+                    + f" (only {max(0, slack)} min usable). "
+                    "Push the deadline or shorten the job."
+                ),
+            )
+
+    # 4. Earliest access too late vs work_end (+ OT) — no engineer can fit.
+    if available:
+        latest_end_with_ot = max(
+            time_to_minutes(e.work_end) + OVERTIME_ALLOWANCE_MIN
+            for e in available
+        )
+        earliest = time_to_minutes(job.earliest_access)
+        if earliest + job.duration_minutes > latest_end_with_ot:
+            return _with_reason(
+                job,
+                tag="window_after_workday",
+                reason=(
+                    f"Earliest access {earliest // 60:02d}:{earliest % 60:02d} "
+                    f"+ {job.duration_minutes} min runs past every engineer's "
+                    "work-end (incl. overtime). Lift access window or extend hours."
+                ),
+            )
+
+    # 5. 2PL pair — needs at least 2 available engineers; if not, the
+    # pairing constraint forces it to drop.
+    if job.two_engineer and len(available) < 2:
+        return _with_reason(
+            job,
+            tag="two_engineer_pair_dropped",
+            reason=(
+                f"2-engineer job needs two available engineers; only "
+                f"{len(available)} working today."
+            ),
+        )
+
+    # Nothing clearly diagnosable — leave reason blank. Most common
+    # cause when this fires is the day being over-packed: every
+    # engineer's route hit a hard time/parts constraint that pushed
+    # this stop out via the disjunction penalty.
+    return _with_reason(job, tag=None, reason=None)
+
+
+def _with_reason(job: Job, *, tag: str | None, reason: str | None) -> Job:
+    """Return a copy of `job` with diagnostic fields populated."""
+    return Job(
+        call_number=job.call_number,
+        site_name=job.site_name,
+        postcode=job.postcode,
+        earliest_access=job.earliest_access,
+        latest_departure=job.latest_departure,
+        duration_minutes=job.duration_minutes,
+        required_parts=job.required_parts,
+        two_engineer=job.two_engineer,
+        is_pair_secondary=job.is_pair_secondary,
+        is_shadow_duplicate=job.is_shadow_duplicate,
+        forced_engineer_name=job.forced_engineer_name,
+        must_be_first=job.must_be_first,
+        call_category=job.call_category,
+        unassigned_reason=reason,
+        unassigned_reason_tag=tag,
+    )
