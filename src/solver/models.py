@@ -60,6 +60,12 @@ class Job:
     two_engineer: bool = False
     is_pair_secondary: bool = False
     is_shadow_duplicate: bool = False
+    # Forced engineer assignment — set when the office has hand-picked
+    # who must do this job (typically COL collection runs where the
+    # office knows which engineer's van the parts belong on). The
+    # solver restricts VehicleVar to this engineer's index, so the
+    # optimiser can't override the assignment based on geography.
+    forced_engineer_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +150,13 @@ class JobIn(BaseModel):
         "The optimiser duplicates the node and constrains both stops to "
         "different vehicles + arrivals within 30 min of each other.",
     )
+    forced_engineer_name: str | None = Field(
+        default=None,
+        description="Name of the engineer who MUST do this job — used "
+        "for COL collection runs the office hand-assigns. The solver "
+        "restricts VehicleVar to that engineer's index so the optimiser "
+        "can't reassign based on geography.",
+    )
 
     @field_validator("postcode")
     @classmethod
@@ -159,6 +172,7 @@ class JobIn(BaseModel):
             duration_minutes=self.duration_minutes,
             required_parts=tuple(p.to_internal() for p in self.required_parts),
             two_engineer=self.two_engineer,
+            forced_engineer_name=self.forced_engineer_name,
         )
 
 

@@ -236,6 +236,28 @@ def solve_vrptw(
                 index = manager.NodeToIndex(n_eng + j_idx)
                 routing.VehicleVar(index).SetValues(list(eligible) + [-1])
 
+    # Forced-engineer assignment (COL collection runs). When the office
+    # has hand-picked who must collect parts for a job, restrict the
+    # job's VehicleVar to ONLY that engineer's index. -1 stays in the
+    # allowed set so the solver can still drop the job (with the
+    # disjunction penalty) if that engineer is full or unavailable —
+    # better than refusing the whole plan.
+    for j_idx, job in enumerate(jobs):
+        if not job.forced_engineer_name:
+            continue
+        forced_idx = next(
+            (v for v, eng in enumerate(engineers)
+             if eng.name == job.forced_engineer_name),
+            None,
+        )
+        if forced_idx is None:
+            # Engineer not in the active list (off, deleted, name typo).
+            # Leave the job unconstrained — solver picks the best fit
+            # or drops it. Optimiser-level warning happens upstream.
+            continue
+        index = manager.NodeToIndex(n_eng + j_idx)
+        routing.VehicleVar(index).SetValues([forced_idx, -1])
+
     # 2PL pairing — different vehicles, arrivals synced, both-or-neither.
     # Constraints are gated on ActiveVar so dropping the pair (when no
     # feasible 2-engineer assignment exists) is still allowed; otherwise
