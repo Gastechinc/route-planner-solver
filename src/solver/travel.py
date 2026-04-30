@@ -102,6 +102,42 @@ def _mapbox_call(
     return data
 
 
+def _safe_chunks(items: list[int], max_size: int) -> list[list[int]]:
+    """Split `items` into chunks of length ≤ max_size, never leaving a
+    final chunk of size 1.
+
+    The Mapbox Matrix endpoint requires ≥2 elements (1 source × ≥2
+    destinations or ≥2 sources × 1 destination). When chunking N items
+    into max_size groups would leave a 1-item remainder, we shrink the
+    preceding chunk so the tail carries 2 items instead.
+
+      N=10, max_size=9  → [9, 1]    ✗  (matrix rejects the 1)
+                          [8, 2]   ✓  (this function returns this)
+      N=11, max_size=9  → [9, 2]   ✓  natural split is fine
+      N=19, max_size=9  → [9, 9, 1] ✗
+                          [9, 8, 2] ✓
+    """
+    n = len(items)
+    if n <= 1:
+        return [items] if n == 1 else []
+    if n <= max_size:
+        return [items]
+    chunks: list[list[int]] = []
+    i = 0
+    while i < n:
+        remaining = n - i
+        if remaining <= max_size:
+            chunks.append(items[i:])
+            break
+        # Standard chunk size, unless next iteration would be left with
+        # exactly 1 item — in that case shrink THIS chunk by 1 so the
+        # next iteration ends up with 2.
+        size = max_size - 1 if (remaining - max_size) == 1 else max_size
+        chunks.append(items[i : i + size])
+        i += size
+    return chunks
+
+
 def mapbox_travel_matrix(
     coords: list[tuple[float, float]],
     token: str,
@@ -137,11 +173,15 @@ def mapbox_travel_matrix(
         return TravelMatrix(seconds=seconds, distance_metres=distances)
 
     # Chunked path: for each origin, query its row in chunks of (max-1) destinations.
+    # Chunking has to avoid leaving a tail chunk of size 1 — the Matrix API
+    # rejects 1×1 calls with "Not enough input sources and destinations
+    # given, resulting in only 1 matrix element". When the natural split
+    # would produce a single-destination tail, _safe_chunks shrinks the
+    # previous chunk by one so the tail has at least 2 items.
     chunk_size = max_per_call - 1
     for i in range(n):
         others = [j for j in range(n) if j != i]
-        for c0 in range(0, len(others), chunk_size):
-            chunk = others[c0 : c0 + chunk_size]
+        for chunk in _safe_chunks(others, chunk_size):
             request_coords = [coords[i]] + [coords[j] for j in chunk]
             data = _mapbox_call(
                 request_coords,
