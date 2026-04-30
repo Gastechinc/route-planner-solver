@@ -224,7 +224,22 @@ def solve_vrptw(
         routing.AddDisjunction([manager.NodeToIndex(node)], DROP_PENALTY_MIN)
 
     # Parts-aware HARD constraint (only when stock is loaded).
+    #
+    # Two-layer constraint:
+    #   1. Per-job vehicle restriction (existing) — a job that needs a
+    #      part can only go to engineers whose vans had at least 1 of it
+    #      at start of day. This is a fast prune that limits the search.
+    #   2. Cumulative per-part dimension (new) — across each engineer's
+    #      whole route, total demand for each part code can't exceed
+    #      that van's starting stock. This catches the "engineer fits
+    #      part X at stop A then is asked to fit X again at stop B but
+    #      van only had 1" case that the per-job check misses.
+    #
+    # Cumulative is implemented as one dimension per distinct part code
+    # via AddDimensionWithVehicleCapacity. With the typical 10-50
+    # distinct codes per day this adds ~10ms to solve time.
     if stock is not None:
+        # Layer 1 — per-job vehicle restriction.
         for j_idx, job in enumerate(jobs):
             if not job.required_parts:
                 continue
@@ -235,6 +250,66 @@ def solve_vrptw(
             if eligible and len(eligible) < n_eng:
                 index = manager.NodeToIndex(n_eng + j_idx)
                 routing.VehicleVar(index).SetValues(list(eligible) + [-1])
+
+        # Layer 2 — cumulative per-part dimension.
+        #
+        # Build the set of distinct (non-billing-only) part codes
+        # demanded across all jobs today. For each, register a unary
+        # transit callback that returns the per-job demand for that
+        # code (0 for engineer nodes / shadows / jobs that don't need
+        # this code; quantity for jobs that do).
+        all_codes: set[str] = set()
+        for job in jobs:
+            for p in job.required_parts:
+                if is_billing_only(p.code, billing_only_codes):
+                    continue
+                all_codes.add(p.code.strip().upper())
+
+        for code in all_codes:
+            # Per-vehicle capacity = van's starting stock of this code.
+            # Real engineers only — there's no "unassigned vehicle" in
+            # the active list. If the van has 0, capacity is 0 and the
+            # solver will refuse to send any job needing this part to
+            # that engineer (subsumes the per-job restriction's effect
+            # for the zero-stock case).
+            capacities = []
+            for eng in engineers:
+                van = eng.vehicle_reg.strip().upper() if eng.vehicle_reg else ""
+                qty = stock.quantity(van, code) if van else 0
+                # OR-Tools wants ints; quantity is float-typed elsewhere
+                # but always whole units in practice. Floor to be safe.
+                capacities.append(max(0, int(qty)))
+
+            # Per-stop demand callback. Closure captures `code` via
+            # default arg to dodge Python's late-binding gotcha when
+            # building callbacks in a loop.
+            def _demand_cb(idx, code=code, n_eng=n_eng, jobs=jobs, manager=manager):
+                node = manager.IndexToNode(idx)
+                if node < n_eng:
+                    return 0
+                j_idx = node - n_eng
+                if j_idx >= len(jobs):
+                    return 0
+                # Shadow secondaries don't actually fit — don't double
+                # count their demand against the engineer's stock.
+                if jobs[j_idx].is_shadow_duplicate:
+                    return 0
+                for p in jobs[j_idx].required_parts:
+                    if p.code.strip().upper() == code:
+                        return int(p.quantity)
+                return 0
+
+            cb_idx = routing.RegisterUnaryTransitCallback(_demand_cb)
+            # Dimension name needs to be unique + a valid identifier.
+            dim_name = "Part_" + "".join(
+                c if c.isalnum() else "_" for c in code
+            )[:60]
+            # AddDimensionWithVehicleCapacity:
+            #   evaluator_index, slack, vehicle_capacities,
+            #   fix_start_cumul_to_zero, name
+            routing.AddDimensionWithVehicleCapacity(
+                cb_idx, 0, capacities, True, dim_name
+            )
 
     # Forced-engineer assignment (COL collection runs). When the office
     # has hand-picked who must collect parts for a job, restrict the
