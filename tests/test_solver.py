@@ -461,6 +461,49 @@ def test_latest_departure_enforces_off_site_deadline() -> None:
         f"Departure after 11:00 violates latest_departure: "
         f"got {found[0]['departure_minute']}"
     )
+    # Buffer in front of the deadline — the solver should clear the cut-off
+    # by at least LATEST_DEPARTURE_BUFFER_MIN where feasible. With earliest
+    # 08:00 + duration 60, the buffer is well within the available window.
+    from solver.solver import LATEST_DEPARTURE_BUFFER_MIN
+
+    slack = 11 * 60 - found[0]["departure_minute"]
+    assert slack >= LATEST_DEPARTURE_BUFFER_MIN, (
+        f"Expected at least {LATEST_DEPARTURE_BUFFER_MIN} min slack before "
+        f"the 11:00 deadline; got {slack} min "
+        f"(departure {found[0]['departure_minute']})"
+    )
+
+
+def test_latest_departure_buffer_drops_when_infeasible_otherwise() -> None:
+    """
+    A job whose buffered constraint would be infeasible (e.g. earliest 09:30
+    + duration 60 + buffer 15 = 645 > deadline 660) must STILL be schedulable
+    — falling back to no-buffer rather than dropped. Better to run the
+    deadline tight than refuse the work.
+    """
+    payload = _base_two_engineer_payload()
+    payload["jobs"] = [
+        {
+            "call_number": "30310",
+            "site_name": "Tight but feasible",
+            "postcode": "WC1A 1BS",
+            "earliest_access": "09:30",
+            "latest_departure": "11:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    routed = [
+        stop
+        for rt in data["routes"]
+        for stop in rt["stops"]
+        if stop["call_number"] == "30310"
+    ]
+    assert len(routed) == 1, "Job must still be routed when buffer back-off is needed"
+    assert routed[0]["departure_minute"] <= 11 * 60, "Deadline still respected"
 
 
 def test_latest_departure_drops_infeasible_job() -> None:

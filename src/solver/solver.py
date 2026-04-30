@@ -73,6 +73,16 @@ PAIR_ARRIVAL_TOLERANCE_MIN = 30
 #   engineer is already full the assignment still happens rather than
 #   the job being dropped.
 PREFERENCE_MISMATCH_PENALTY_MIN = 90
+# Safety buffer in front of a job's `latest_departure` deadline. Without it
+# the solver is technically compliant when arrival + duration == deadline
+# (e.g. 09:48 + 60 = 10:48 against a 11:00 deadline = 12 min slack). That
+# leaves the engineer no room for traffic noise, an over-running job, or
+# the customer locking up early. We ask the solver to clear the deadline
+# by at least this many minutes — i.e. arrival + duration + buffer ≤
+# latest_departure — so a "off-site by 11" job is targeted to be done by
+# ~10:45 at the latest, not 10:59. Hard constraint; if no slot can clear
+# the buffer the job is dropped via the disjunction (same as before).
+LATEST_DEPARTURE_BUFFER_MIN = 15
 
 
 def time_to_minutes(t: time) -> int:
@@ -227,16 +237,30 @@ def solve_vrptw(
         latest_arrival = max(earliest, latest_with_ot - job.duration_minutes)
         time_dim.CumulVar(index).SetRange(earliest, latest_arrival)
         # Customer "must be off site by" deadline — derived from source
-        # xls Fix Date. arrival + duration ≤ latest_departure.
+        # xls Fix Date. arrival + duration + buffer ≤ latest_departure.
         # Adding this as a separate constraint (not by clamping the
         # range) is the only way to make the case where earliest +
         # duration > latest_departure properly infeasible — which
         # combined with the disjunction means the solver drops the job
         # rather than scheduling it in violation of the deadline.
+        # The buffer is there so the solver doesn't pick a slot that
+        # JUST clears the deadline (e.g. 12 min spare against an 11:00
+        # cut-off) — engineers need realistic room for traffic, an
+        # over-running job, etc. Falls back to no-buffer if buffer
+        # makes the job infeasible.
         if job.latest_departure is not None:
             deadline = time_to_minutes(job.latest_departure)
+            buffer_min = LATEST_DEPARTURE_BUFFER_MIN
+            # If the buffered constraint would make this job infeasible
+            # (earliest + duration + buffer > deadline), back off the
+            # buffer so the job can still be scheduled rather than
+            # dropped — better to run the deadline tight than refuse
+            # the work.
+            if earliest + job.duration_minutes + buffer_min > deadline:
+                buffer_min = max(0, deadline - earliest - job.duration_minutes)
             cp_solver_for_windows.Add(
-                time_dim.CumulVar(index) + job.duration_minutes <= deadline
+                time_dim.CumulVar(index) + job.duration_minutes + buffer_min
+                <= deadline
             )
 
     # Job-count dimension — drives even workload distribution.
