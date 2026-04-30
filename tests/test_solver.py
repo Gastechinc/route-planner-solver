@@ -426,3 +426,131 @@ def test_attendance_window_constrains_arrival() -> None:
         f"Arrival before 14:00 violates the earliest_access window: "
         f"got {found[0]['arrival_minute']}"
     )
+
+
+def test_latest_departure_enforces_off_site_deadline() -> None:
+    """
+    A job with latest_departure = 11:00 and duration 60 min — the solver
+    must schedule arrival ≤ 10:00 so the engineer is off site by 11:00.
+    Without this constraint the solver would happily arrive at 10:30.
+    """
+    payload = _base_two_engineer_payload()
+    payload["jobs"] = [
+        {
+            "call_number": "30300",
+            "site_name": "Off-site by 11",
+            "postcode": "WC1A 1BS",
+            "earliest_access": "08:00",
+            "latest_departure": "11:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    found = [
+        stop
+        for rt in data["routes"]
+        for stop in rt["stops"]
+        if stop["call_number"] == "30300"
+    ]
+    assert len(found) == 1, "Job must be routed once"
+    # arrival + duration must be ≤ latest_departure (660 minutes from midnight)
+    assert found[0]["departure_minute"] <= 11 * 60, (
+        f"Departure after 11:00 violates latest_departure: "
+        f"got {found[0]['departure_minute']}"
+    )
+
+
+def test_latest_departure_drops_infeasible_job() -> None:
+    """
+    A job with earliest_access = 10:00, latest_departure = 10:30, but a
+    60-min duration is infeasible — must be DROPPED to unassigned, not
+    scheduled in violation of either bound.
+    """
+    payload = _base_two_engineer_payload()
+    payload["jobs"] = [
+        {
+            "call_number": "30301",
+            "site_name": "Impossible window",
+            "postcode": "WC1A 1BS",
+            "earliest_access": "10:00",
+            "latest_departure": "10:30",
+            "duration_minutes": 60,
+            "required_parts": [],
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    routed = [
+        stop
+        for rt in data["routes"]
+        for stop in rt["stops"]
+        if stop["call_number"] == "30301"
+    ]
+    unassigned = [u for u in data["unassigned"] if u["call_number"] == "30301"]
+    # Either dropped, OR (defence in depth) routed but not violating the
+    # deadline. We assert dropped here because the solver's clamp-then-drop
+    # path is the cleaner outcome.
+    if routed:
+        assert routed[0]["departure_minute"] <= 10 * 60 + 30, (
+            "If the solver did schedule it, departure must respect the deadline"
+        )
+    else:
+        assert len(unassigned) == 1, (
+            "Infeasible job must end up in unassigned"
+        )
+
+
+def test_must_be_first_makes_job_the_first_stop() -> None:
+    """
+    Three jobs across two engineers — one flagged must_be_first. Whichever
+    engineer ends up serving it, that engineer's first stop (index 0) must
+    be the flagged job.
+    """
+    payload = _base_two_engineer_payload()
+    payload["jobs"] = [
+        {
+            "call_number": "30401",
+            "site_name": "Must Be First",
+            "postcode": "WC1A 1BS",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+            "must_be_first": True,
+        },
+        {
+            "call_number": "30402",
+            "site_name": "Filler A",
+            "postcode": "HA3 0EL",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+        },
+        {
+            "call_number": "30403",
+            "site_name": "Filler B",
+            "postcode": "GU17 9HS",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # Find the route that took the must-be-first job
+    serving_route = None
+    for rt in data["routes"]:
+        if any(s["call_number"] == "30401" for s in rt["stops"]):
+            serving_route = rt
+            break
+    assert serving_route is not None, (
+        "must_be_first job was dropped — should have been routed"
+    )
+    assert serving_route["stops"][0]["call_number"] == "30401", (
+        f"must_be_first job must be the first stop on its route; "
+        f"got order: {[s['call_number'] for s in serving_route['stops']]}"
+    )

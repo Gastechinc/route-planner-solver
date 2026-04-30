@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, time
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -47,6 +47,12 @@ class Job:
     site_name: str
     postcode: str
     earliest_access: time = time(8, 0)
+    # Hard "must be off site by" deadline — derived from the source xls
+    # "Fix Date" field. The solver enforces departure_minute ≤
+    # latest_departure (i.e. arrival_minute + duration ≤ latest_departure)
+    # so the engineer is GONE by this time, not just arriving by it. None
+    # means no deadline beyond the engineer's normal work_end + overtime.
+    latest_departure: time | None = None
     duration_minutes: int = 60
     required_parts: tuple[RequiredPart, ...] = ()
     # 2PL — needs two engineers on scene simultaneously.
@@ -66,6 +72,10 @@ class Job:
     # solver restricts VehicleVar to this engineer's index, so the
     # optimiser can't override the assignment based on geography.
     forced_engineer_name: str | None = None
+    # Must-be-first — when set, this job must be the FIRST non-depot
+    # stop on whichever vehicle ends up serving it. Used for jobs the
+    # office has promised the customer as the day's opening call.
+    must_be_first: bool = False
 
 
 @dataclass(frozen=True)
@@ -142,6 +152,13 @@ class JobIn(BaseModel):
     site_name: str
     postcode: str
     earliest_access: TimeStr = "08:00"
+    latest_departure: Optional[TimeStr] = Field(
+        default=None,
+        description="Hard 'must be off site by' deadline (HH:MM). Derived "
+        "from the source xls 'Fix Date' field. Solver enforces "
+        "departure_minute ≤ this — so the engineer is GONE by this time, "
+        "not just arriving by it. None ⇒ no deadline beyond work_end+OT.",
+    )
     duration_minutes: int = Field(default=60, ge=1, le=600)
     required_parts: list[RequiredPartIn] = Field(default_factory=list)
     two_engineer: bool = Field(
@@ -157,6 +174,15 @@ class JobIn(BaseModel):
         "restricts VehicleVar to that engineer's index so the optimiser "
         "can't reassign based on geography.",
     )
+    must_be_first: bool = Field(
+        default=False,
+        description="If true, this job must be the FIRST non-depot stop "
+        "on whichever vehicle ends up serving it (NextVar(Start(v)) is "
+        "constrained to this job's node when assigned). Multiple "
+        "must_be_first jobs on the same vehicle would conflict — the "
+        "solver will drop one (paying the disjunction penalty) rather "
+        "than refuse the plan.",
+    )
 
     @field_validator("postcode")
     @classmethod
@@ -169,10 +195,16 @@ class JobIn(BaseModel):
             site_name=self.site_name,
             postcode=self.postcode,
             earliest_access=_parse_time(self.earliest_access),
+            latest_departure=(
+                _parse_time(self.latest_departure)
+                if self.latest_departure is not None
+                else None
+            ),
             duration_minutes=self.duration_minutes,
             required_parts=tuple(p.to_internal() for p in self.required_parts),
             two_engineer=self.two_engineer,
             forced_engineer_name=self.forced_engineer_name,
+            must_be_first=self.must_be_first,
         )
 
 

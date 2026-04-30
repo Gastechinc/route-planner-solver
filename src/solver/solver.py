@@ -191,12 +191,31 @@ def solve_vrptw(
 
     latest_work_end = max(time_to_minutes(e.work_end) for e in engineers)
     latest_with_ot = min(latest_work_end + OVERTIME_ALLOWANCE_MIN, HORIZON_MIN - 1)
+    cp_solver_for_windows = routing.solver()
     for j_idx, job in enumerate(jobs):
         node = n_eng + j_idx
         index = manager.NodeToIndex(node)
         earliest = time_to_minutes(job.earliest_access)
+        # Standard arrival window: must fit within the engineer's work
+        # day (with OT). Use a wide-open upper bound so an infeasible
+        # latest_departure deadline (added below as a separate hard
+        # constraint) forces the solver to DROP the job via the
+        # disjunction, rather than us silently clamping to a value
+        # that violates the customer's off-site deadline.
         latest_arrival = max(earliest, latest_with_ot - job.duration_minutes)
         time_dim.CumulVar(index).SetRange(earliest, latest_arrival)
+        # Customer "must be off site by" deadline — derived from source
+        # xls Fix Date. arrival + duration ≤ latest_departure.
+        # Adding this as a separate constraint (not by clamping the
+        # range) is the only way to make the case where earliest +
+        # duration > latest_departure properly infeasible — which
+        # combined with the disjunction means the solver drops the job
+        # rather than scheduling it in violation of the deadline.
+        if job.latest_departure is not None:
+            deadline = time_to_minutes(job.latest_departure)
+            cp_solver_for_windows.Add(
+                time_dim.CumulVar(index) + job.duration_minutes <= deadline
+            )
 
     # Job-count dimension — drives even workload distribution.
     jobs_cb_idx = routing.RegisterUnaryTransitCallback(
@@ -332,6 +351,38 @@ def solve_vrptw(
             continue
         index = manager.NodeToIndex(n_eng + j_idx)
         routing.VehicleVar(index).SetValues([forced_idx, -1])
+
+    # Must-be-first — for jobs the office has promised the customer as
+    # the day's opening call. On whichever vehicle ends up serving the
+    # job, NextVar(Start(v)) must be the job's node. Implementation:
+    #
+    #   For each must_be_first job j and each vehicle v:
+    #     active(j) ∧ vehicle(j)==v  ⇒  next_after_start(v) == node(j)
+    #
+    # Linearised as:
+    #     next_eq_job(v) + (1 - is_this_v) + (1 - active) >= 1
+    #
+    # If two must_be_first jobs land on the same vehicle the constraints
+    # conflict and the solver drops one (paying the disjunction penalty)
+    # rather than refusing the whole plan — same graceful-degrade pattern
+    # as forced_engineer.
+    cp_solver = routing.solver()
+    for j_idx, job in enumerate(jobs):
+        if not job.must_be_first:
+            continue
+        # Shadow secondaries don't carry the flag — primary holds it.
+        if job.is_shadow_duplicate:
+            continue
+        job_node_index = manager.NodeToIndex(n_eng + j_idx)
+        job_veh = routing.VehicleVar(job_node_index)
+        job_active = routing.ActiveVar(job_node_index)
+        for v in range(n_eng):
+            next_after_start = routing.NextVar(routing.Start(v))
+            is_this_v = cp_solver.IsEqualCstVar(job_veh, v)
+            next_eq_job = cp_solver.IsEqualCstVar(
+                next_after_start, job_node_index
+            )
+            cp_solver.Add(next_eq_job + (1 - is_this_v) + (1 - job_active) >= 1)
 
     # 2PL pairing — different vehicles, arrivals synced, both-or-neither.
     # Constraints are gated on ActiveVar so dropping the pair (when no
