@@ -554,3 +554,102 @@ def test_must_be_first_makes_job_the_first_stop() -> None:
         f"must_be_first job must be the first stop on its route; "
         f"got order: {[s['call_number'] for s in serving_route['stops']]}"
     )
+
+
+def test_engineer_preference_biases_assignment() -> None:
+    """
+    Two engineers, both equally placed geographically. One job each.
+    Engineer A prefers contract_pm, Engineer B prefers emergency.
+    Two jobs: one PMV, one emergency. The PMV must go to A and the
+    emergency to B — preference penalty makes any swap more expensive.
+    """
+    payload = _base_two_engineer_payload()
+    # Both engineers anchored at the same SE1 home so geography is
+    # neutral; only the preference penalty drives the assignment.
+    payload["engineers"][0]["home_postcode"] = "SE1 7PB"
+    payload["engineers"][1]["home_postcode"] = "SE1 7PB"
+    # Carl (engineer 0) prefers contract_pm (PMVs)
+    payload["engineers"][0]["preferred_call_categories"] = ["contract_pm"]
+    # Gavin (engineer 1) prefers emergency (breakdowns)
+    payload["engineers"][1]["preferred_call_categories"] = ["emergency"]
+
+    payload["jobs"] = [
+        {
+            "call_number": "30501",
+            "site_name": "PMV site",
+            "postcode": "SE1 7PB",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+            "call_category": "contract_pm",
+        },
+        {
+            "call_number": "30502",
+            "site_name": "Emergency site",
+            "postcode": "SE1 7PB",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+            "call_category": "emergency",
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    # Map call_number -> assigned engineer name
+    by_call: dict[str, str] = {}
+    for rt in data["routes"]:
+        for stop in rt["stops"]:
+            by_call[stop["call_number"]] = rt["engineer_name"]
+
+    assert "30501" in by_call, "PMV must be routed"
+    assert "30502" in by_call, "Emergency must be routed"
+    assert by_call["30501"] == "Carl Wellington", (
+        f"PMV should go to Carl (contract_pm preference); got {by_call['30501']}"
+    )
+    assert by_call["30502"] == "Gavin Daley Bovell", (
+        f"Emergency should go to Gavin (emergency preference); got {by_call['30502']}"
+    )
+
+
+def test_engineer_preference_yields_to_capacity() -> None:
+    """
+    One engineer (Gavin) with preference, two PMV jobs. Even though Carl
+    has no preference for PMV, the solver should still route both jobs
+    rather than dropping one to honour the preference — the penalty is
+    SOFT and yields to feasibility.
+    """
+    payload = _base_two_engineer_payload()
+    payload["engineers"][1]["preferred_call_categories"] = ["contract_pm"]
+    payload["jobs"] = [
+        {
+            "call_number": "30601",
+            "site_name": "PMV A",
+            "postcode": "WC1A 1BS",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+            "call_category": "contract_pm",
+        },
+        {
+            "call_number": "30602",
+            "site_name": "PMV B",
+            "postcode": "HA3 0EL",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+            "call_category": "contract_pm",
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    routed_calls = {
+        stop["call_number"]
+        for rt in data["routes"]
+        for stop in rt["stops"]
+    }
+    # Both should be routed — preference is soft, feasibility wins.
+    assert "30601" in routed_calls, "PMV A must still be routed"
+    assert "30602" in routed_calls, "PMV B must still be routed"

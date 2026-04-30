@@ -76,6 +76,14 @@ class Job:
     # stop on whichever vehicle ends up serving it. Used for jobs the
     # office has promised the customer as the day's opening call.
     must_be_first: bool = False
+    # Call-type category — passed through from the route-planner-web
+    # taxonomy (contract_pm / emergency / recall / standard / etc.).
+    # Used by the per-engineer preference soft constraint: when an
+    # engineer has a non-empty preferred_call_categories list AND this
+    # category isn't in it, the assignment is penalised so the solver
+    # biases toward better-matched engineers. None ⇒ no preference
+    # check (treated as a generalist match).
+    call_category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,11 @@ class Engineer:
     work_end: time = time(16, 0)
     vehicle_reg: str = ""
     availability: Availability = Availability.AVAILABLE
+    # Engineer's preferred call-type categories. Empty = generalist
+    # (no preference). Non-empty = solver applies a soft penalty when
+    # a job whose category isn't in this set is assigned to them.
+    # Tuple (not list) so the dataclass stays frozen + hashable.
+    preferred_call_categories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -183,6 +196,13 @@ class JobIn(BaseModel):
         "solver will drop one (paying the disjunction penalty) rather "
         "than refuse the plan.",
     )
+    call_category: Optional[str] = Field(
+        default=None,
+        description="Resolved call-type category from the route-planner "
+        "taxonomy (e.g. contract_pm / emergency / recall / standard). "
+        "Used to apply per-engineer preference penalties. None ⇒ no "
+        "preference check.",
+    )
 
     @field_validator("postcode")
     @classmethod
@@ -205,6 +225,7 @@ class JobIn(BaseModel):
             two_engineer=self.two_engineer,
             forced_engineer_name=self.forced_engineer_name,
             must_be_first=self.must_be_first,
+            call_category=self.call_category,
         )
 
 
@@ -215,6 +236,13 @@ class EngineerIn(BaseModel):
     work_end: TimeStr = "16:00"
     vehicle_reg: str = ""
     availability: Availability = Availability.AVAILABLE
+    preferred_call_categories: list[str] = Field(
+        default_factory=list,
+        description="Call-type categories this engineer prefers. Empty "
+        "list = generalist (no penalty either way). Non-empty list = "
+        "soft penalty applied when a job whose category isn't in this "
+        "list is assigned to them.",
+    )
 
     @field_validator("home_postcode", "vehicle_reg")
     @classmethod
@@ -229,6 +257,7 @@ class EngineerIn(BaseModel):
             work_end=_parse_time(self.work_end),
             vehicle_reg=self.vehicle_reg,
             availability=self.availability,
+            preferred_call_categories=tuple(self.preferred_call_categories),
         )
 
 

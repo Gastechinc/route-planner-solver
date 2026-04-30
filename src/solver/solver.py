@@ -64,6 +64,15 @@ SEARCH_TIME_SECONDS = 10
 # Generous enough to absorb traffic noise, tight enough that they're genuinely
 # on-site together (not back-to-back drop-bys 25 min apart).
 PAIR_ARRIVAL_TOLERANCE_MIN = 30
+# Per-engineer call-type preference penalty (per stop). Charged in the
+# per-vehicle arc cost when an engineer has a non-empty preference list
+# AND the job's category isn't in it. Tuned so the solver biases toward
+# preferred matches without overruling geography on a busy day:
+#   90 min ≈ one cross-London leg = the solver will accept a noticeable
+#   detour to send a PMV to the right engineer, but if every preferred
+#   engineer is already full the assignment still happens rather than
+#   the job being dropped.
+PREFERENCE_MISMATCH_PENALTY_MIN = 90
 
 
 def time_to_minutes(t: time) -> int:
@@ -148,9 +157,14 @@ def solve_vrptw(
     manager = pywrapcp.RoutingIndexManager(n_nodes, n_eng, starts, ends)
     routing = pywrapcp.RoutingModel(manager)
 
-    # Per-vehicle arc cost: base travel minutes + missing-parts penalty.
+    # Per-vehicle arc cost: base travel minutes + missing-parts penalty
+    # + call-category preference penalty.
     def make_cost_cb(vehicle_idx: int):
         eng = engineers[vehicle_idx]
+        # Pre-compute the engineer's preference set once per vehicle
+        # rather than per-arc — this callback fires thousands of times
+        # during the OR-Tools search.
+        prefs = set(eng.preferred_call_categories)
 
         def cb(from_idx: int, to_idx: int) -> int:
             f = manager.IndexToNode(from_idx)
@@ -160,6 +174,14 @@ def solve_vrptw(
                 job = jobs[t - n_eng]
                 missing = _missing_parts(eng, job, stock, billing_only_codes)
                 base += len(missing) * MISSING_PART_PENALTY_MIN
+                # Soft preference: if the engineer has expressed any
+                # preference AND this job's category isn't in it,
+                # charge the mismatch penalty. Generalists (empty prefs)
+                # pay no penalty either way. Jobs with no resolved
+                # category (call_category=None) also skip — we don't
+                # penalise on missing taxonomy data.
+                if prefs and job.call_category and job.call_category not in prefs:
+                    base += PREFERENCE_MISMATCH_PENALTY_MIN
             return base
 
         return cb
