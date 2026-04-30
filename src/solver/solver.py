@@ -437,6 +437,15 @@ def solve_vrptw(
     # allowed set so the solver can still drop the job (with the
     # disjunction penalty) if that engineer is full or unavailable —
     # better than refusing the whole plan.
+    #
+    # NB: when the named engineer isn't in the active routing list
+    # (OFF / annual leave / name typo / deleted account), we MUST NOT
+    # leave the constraint unset — that lets the solver silently route
+    # the job to whoever's cheapest, which the office reads as the
+    # planner ignoring the lock. Lock the VehicleVar to [-1] only
+    # (i.e. "may only be unassigned") so the disjunction drops it
+    # and diagnose_unassigned can surface the
+    # `forced_engineer_unavailable` reason instead of a mystery drop.
     for j_idx, job in enumerate(jobs):
         if not job.forced_engineer_name:
             continue
@@ -445,12 +454,13 @@ def solve_vrptw(
              if eng.name == job.forced_engineer_name),
             None,
         )
-        if forced_idx is None:
-            # Engineer not in the active list (off, deleted, name typo).
-            # Leave the job unconstrained — solver picks the best fit
-            # or drops it. Optimiser-level warning happens upstream.
-            continue
         index = manager.NodeToIndex(n_eng + j_idx)
+        if forced_idx is None:
+            # Engineer not in the routing pool — lock to "drop only"
+            # so the office gets a clear unassigned reason instead of
+            # the job silently rerouting.
+            routing.VehicleVar(index).SetValues([-1])
+            continue
         routing.VehicleVar(index).SetValues([forced_idx, -1])
 
     # Must-be-first — for jobs the office has promised the customer as
@@ -699,13 +709,32 @@ def diagnose_unassigned(
                 ),
             )
 
-    # 2. Forced engineer (COL) — locked to someone unavailable.
+    # 2. Forced engineer (COL) — locked to someone who isn't in today's
+    # routing pool. By the time diagnose_unassigned runs the engineers
+    # list has already been filtered to AVAILABLE-only by optimiser.py,
+    # so a missing target covers both "name typo" and "marked OFF/AL"
+    # — they're indistinguishable from this side, but the message
+    # doesn't need to distinguish either: the office just needs to
+    # know the lock can't be honoured.
     if job.forced_engineer_name:
         target = next(
             (e for e in engineers if e.name == job.forced_engineer_name),
             None,
         )
-        if target and target.availability != Availability.AVAILABLE:
+        if target is None:
+            return _with_reason(
+                job,
+                tag="forced_engineer_unavailable",
+                reason=(
+                    f"Locked to '{job.forced_engineer_name}' but they're "
+                    "not in today's routing pool (off, on annual leave, "
+                    "or the name doesn't match an engineer record). "
+                    "Re-assign the COL or update availability and re-optimise."
+                ),
+            )
+        if target.availability != Availability.AVAILABLE:
+            # Defensive — shouldn't happen given the upstream filter,
+            # but kept in case a future code-path passes the full list.
             return _with_reason(
                 job,
                 tag="forced_engineer_unavailable",
@@ -713,15 +742,6 @@ def diagnose_unassigned(
                     f"Locked to {target.name}, who's "
                     f"{target.availability.value.lower().replace('_', ' ')} today. "
                     "Re-assign or change their availability."
-                ),
-            )
-        if not target and available:
-            return _with_reason(
-                job,
-                tag="forced_engineer_unavailable",
-                reason=(
-                    f"Locked to '{job.forced_engineer_name}' but no "
-                    "engineer with that name is in the team."
                 ),
             )
 

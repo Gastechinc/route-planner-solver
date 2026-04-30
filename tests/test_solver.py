@@ -909,3 +909,88 @@ def test_unassigned_diagnostic_no_reason_falls_back_to_none() -> None:
                 return
     # If everything routed (the matrix was lenient) the test still
     # passes — we're only asserting the shape of unassigned rows.
+
+
+def test_unassigned_diagnostic_forced_engineer_off() -> None:
+    """
+    A job force-locked to an engineer who's marked OFF must DROP with
+    forced_engineer_unavailable rather than silently re-route to a
+    different engineer. Earlier the solver let the constraint slip
+    when the named engineer was filtered out of the routing pool by
+    the upstream availability check; the office reported "I locked
+    this to Carl, why did Gavin take it?".
+    """
+    payload = _base_two_engineer_payload()
+    # Carl marked OFF; Gavin is the only working engineer today.
+    payload["engineers"][0]["availability"] = "OFF"
+    payload["jobs"] = [
+        {
+            "call_number": "30900",
+            "site_name": "Locked to absent Carl",
+            "postcode": "WC1A 1BS",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+            "forced_engineer_name": "Carl Wellington",
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    # Job must NOT be routed to anyone (the lock isn't satisfiable).
+    routed = [
+        stop
+        for rt in data["routes"]
+        for stop in rt["stops"]
+        if stop["call_number"] == "30900"
+    ]
+    assert routed == [], (
+        f"Forced-engineer job must drop when the named engineer is OFF; "
+        f"silent re-route detected — {routed}"
+    )
+
+    # And it must show up in unassigned with the proper diagnostic.
+    unassigned = [u for u in data["unassigned"] if u["call_number"] == "30900"]
+    assert len(unassigned) == 1
+    assert unassigned[0]["reason_tag"] == "forced_engineer_unavailable"
+    assert "Carl" in (unassigned[0]["reason"] or "")
+
+
+def test_unassigned_diagnostic_forced_engineer_unknown_name() -> None:
+    """
+    A job force-locked to a name that doesn't match any engineer must
+    drop the same way as the OFF case — the office sees a clear
+    forced_engineer_unavailable reason rather than a mystery routing.
+    """
+    payload = _base_two_engineer_payload()
+    payload["jobs"] = [
+        {
+            "call_number": "30901",
+            "site_name": "Locked to ghost",
+            "postcode": "WC1A 1BS",
+            "earliest_access": "08:00",
+            "duration_minutes": 60,
+            "required_parts": [],
+            "forced_engineer_name": "Phantom Engineer",
+        },
+    ]
+    r = client.post("/optimise", json=payload, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    routed = [
+        stop
+        for rt in data["routes"]
+        for stop in rt["stops"]
+        if stop["call_number"] == "30901"
+    ]
+    assert routed == [], (
+        f"Forced-engineer job must drop when the name doesn't match; "
+        f"silent re-route detected — {routed}"
+    )
+
+    unassigned = [u for u in data["unassigned"] if u["call_number"] == "30901"]
+    assert len(unassigned) == 1
+    assert unassigned[0]["reason_tag"] == "forced_engineer_unavailable"
+    assert "Phantom Engineer" in (unassigned[0]["reason"] or "")
